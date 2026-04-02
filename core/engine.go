@@ -775,6 +775,20 @@ func (e *Engine) SetProjectStateStore(store *ProjectStateStore) {
 	e.projectState = store
 }
 
+// getWorkDirForSession returns the current working directory for the session.
+func (e *Engine) getWorkDirForSession() string {
+	if e.agent != nil {
+		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+			return wd.GetWorkDir()
+		}
+	}
+	if e.baseWorkDir != "" {
+		return e.baseWorkDir
+	}
+	wd, _ := os.Getwd()
+	return wd
+}
+
 // RemoveCommand removes a custom command by name. Returns false if not found.
 func (e *Engine) RemoveCommand(name string) bool {
 	return e.commands.Remove(name)
@@ -2181,7 +2195,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	state.mu.Lock()
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx)
-	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang())
+	workDir := e.getWorkDirForSession()
+	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workDir)
+	cp.SendInitial() // Send initial progress card immediately
 	state.mu.Unlock()
 
 	// Idle timeout: 0 = disabled
@@ -2655,7 +2671,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				firstEventLogged = false
 				waitStart = time.Now()
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx)
-				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang())
+				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), e.getWorkDirForSession())
+				cp.SendInitial() // Send initial progress card immediately
 
 				session.AddHistory("user", queued.content)
 

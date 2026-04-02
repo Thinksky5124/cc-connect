@@ -63,6 +63,8 @@ type ProgressCardPayload struct {
 	Entries   []string            `json:"entries,omitempty"` // legacy fallback
 	Items     []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
 	Truncated bool                `json:"truncated"`
+	WorkDir   string              `json:"work_dir,omitempty"`   // current working directory
+	StartTime int64               `json:"start_time,omitempty"` // unix timestamp in seconds
 }
 
 // BuildProgressCardPayload encodes progress entries into a transport string.
@@ -90,7 +92,7 @@ func BuildProgressCardPayload(entries []string, truncated bool) string {
 }
 
 // BuildProgressCardPayloadV2 encodes ordered typed progress events.
-func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState) string {
+func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, workDir string, startTime time.Time) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -110,11 +112,17 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 			Success:  item.Success,
 		})
 	}
-	if len(cleaned) == 0 {
+	// Allow empty items if we have metadata (workDir or startTime)
+	// This enables showing an initial progress card before any events
+	if len(cleaned) == 0 && strings.TrimSpace(workDir) == "" && startTime.IsZero() {
 		return ""
 	}
 	if state == "" {
 		state = ProgressCardStateRunning
+	}
+	var startTimeUnix int64
+	if !startTime.IsZero() {
+		startTimeUnix = startTime.Unix()
 	}
 	payload := ProgressCardPayload{
 		Version:   2,
@@ -123,6 +131,8 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 		State:     state,
 		Items:     cleaned,
 		Truncated: truncated,
+		WorkDir:   strings.TrimSpace(workDir),
+		StartTime: startTimeUnix,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -169,7 +179,9 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 			})
 		}
 	}
-	if len(items) == 0 && len(legacy) == 0 {
+	// Allow empty items if we have metadata (workDir or startTime)
+	// This enables showing an initial progress card before any events
+	if len(items) == 0 && len(legacy) == 0 && strings.TrimSpace(payload.WorkDir) == "" && payload.StartTime == 0 {
 		return nil, false
 	}
 	if payload.State == "" {
@@ -226,6 +238,8 @@ type compactProgressWriter struct {
 	truncated  bool
 	lastSent   string
 	maxEntries int
+	workDir    string
+	startTime  time.Time
 }
 
 func normalizeProgressStyle(style string) string {
@@ -262,7 +276,7 @@ func SuppressStandaloneToolResultEvent(p Platform) bool {
 	return progressStyleForPlatform(p) == progressStyleLegacy
 }
 
-func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, agentName string, lang Language) *compactProgressWriter {
+func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, agentName string, lang Language, workDir string) *compactProgressWriter {
 	w := &compactProgressWriter{
 		ctx:        ctx,
 		platform:   p,
@@ -272,6 +286,8 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 		agentName:  normalizeProgressAgentLabel(agentName),
 		lang:       lang,
 		maxEntries: 10,
+		workDir:    strings.TrimSpace(workDir),
+		startTime:  time.Now(),
 	}
 	if w.style != progressStyleCompact && w.style != progressStyleCard {
 		slog.Debug("progress writer disabled: unsupported style", "platform", p.Name(), "style", w.style)
@@ -294,6 +310,51 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 	}
 	slog.Debug("progress writer enabled", "platform", p.Name(), "style", w.style, "use_payload", w.usePayload)
 	return w
+}
+
+// SendInitial sends an initial progress card immediately, before any progress events.
+// This provides instant feedback to the user that processing has started.
+func (w *compactProgressWriter) SendInitial() bool {
+	if !w.enabled || w.failed {
+		slog.Debug("progress writer SendInitial: disabled or failed", "platform", w.platform.Name(), "enabled", w.enabled, "failed", w.failed)
+		return false
+	}
+	if w.style != progressStyleCard || !w.usePayload {
+		slog.Debug("progress writer SendInitial: not card style or no payload", "platform", w.platform.Name(), "style", w.style, "usePayload", w.usePayload)
+		return false
+	}
+	// Build an empty progress card with just metadata
+	w.content = BuildProgressCardPayloadV2(nil, false, w.agentName, w.lang, w.state, w.workDir, w.startTime)
+	if w.content == "" {
+		slog.Debug("progress writer SendInitial: empty content", "platform", w.platform.Name())
+		return false
+	}
+	if w.starter != nil {
+		callCtx, cancel := w.withAPITimeout()
+		handle, err := w.starter.SendPreviewStart(callCtx, w.replyCtx, w.content)
+		cancel()
+		if err != nil || handle == nil {
+			slog.Warn("progress writer: SendInitial SendPreviewStart failed", "platform", w.platform.Name(), "error", err)
+			w.failed = true
+			return false
+		}
+		w.handle = handle
+		w.lastSent = w.content
+		slog.Debug("progress writer SendInitial: success", "platform", w.platform.Name(), "workDir", w.workDir)
+		return true
+	}
+	callCtx, cancel := w.withAPITimeout()
+	err := w.platform.Send(callCtx, w.replyCtx, w.content)
+	cancel()
+	if err != nil {
+		slog.Warn("progress writer: SendInitial Send failed", "platform", w.platform.Name(), "error", err)
+		w.failed = true
+		return false
+	}
+	w.handle = w.replyCtx
+	w.lastSent = w.content
+	slog.Debug("progress writer SendInitial: success via Send", "platform", w.platform.Name())
+	return true
 }
 
 func normalizeProgressAgentLabel(name string) string {
@@ -345,6 +406,7 @@ func (w *compactProgressWriter) AppendEvent(kind ProgressCardEntryKind, text str
 // AppendStructured appends one structured progress event and updates the in-place message.
 func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallback string) bool {
 	if !w.enabled || w.failed {
+		slog.Debug("progress writer AppendStructured: disabled or failed", "platform", w.platform.Name(), "enabled", w.enabled, "failed", w.failed)
 		return false
 	}
 	text := strings.TrimSpace(item.Text)
@@ -384,7 +446,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		}
 		w.truncated = truncated
 		if w.usePayload {
-			w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+			w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state, w.workDir, w.startTime)
 			if w.content == "" {
 				slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
 				w.failed = true
@@ -404,6 +466,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	}
 
 	if w.content == w.lastSent {
+		slog.Debug("progress writer AppendStructured: content unchanged, skip update", "platform", w.platform.Name())
 		return true
 	}
 
@@ -443,6 +506,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		return false
 	}
 	w.lastSent = w.content
+	slog.Debug("progress writer AppendStructured: update success", "platform", w.platform.Name(), "items", len(w.items))
 	return true
 }
 
@@ -450,17 +514,20 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 // appending a new progress entry.
 func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.handle == nil {
+		slog.Debug("progress writer Finalize: skipped", "platform", w.platform.Name(), "enabled", w.enabled, "failed", w.failed, "style", w.style, "usePayload", w.usePayload, "handle", w.handle != nil)
 		return false
 	}
 	if state == "" {
 		state = ProgressCardStateCompleted
 	}
 	if w.state == state {
+		slog.Debug("progress writer Finalize: state unchanged", "platform", w.platform.Name(), "state", state)
 		return true
 	}
 	w.state = state
-	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state, w.workDir, w.startTime)
 	if w.content == "" || w.content == w.lastSent {
+		slog.Debug("progress writer Finalize: content empty or unchanged", "platform", w.platform.Name(), "empty", w.content == "", "unchanged", w.content == w.lastSent)
 		return w.content != ""
 	}
 	callCtx, cancel := w.withAPITimeout()
@@ -472,6 +539,7 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 		return false
 	}
 	w.lastSent = w.content
+	slog.Debug("progress writer Finalize: success", "platform", w.platform.Name(), "state", state, "items", len(w.items))
 	return true
 }
 

@@ -2070,6 +2070,14 @@ func progressNoOutputText(lang string) string {
 	return "No output"
 }
 
+// formatProgressDuration formats a duration for progress card display.
+func formatProgressDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
 func progressResultDot(item core.ProgressCardEntry) string {
 	if item.Success != nil {
 		if *item.Success {
@@ -2158,9 +2166,6 @@ func renderProgressEntryElement(item core.ProgressCardEntry, lang string) map[st
 
 func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string {
 	items := normalizeProgressItems(payload)
-	if len(items) == 0 {
-		return buildCardJSON(" ")
-	}
 
 	agent := progressAgentLabel(payload.Agent)
 	title, template, footer := progressStateMeta(payload.State, payload.Lang, agent)
@@ -2200,6 +2205,50 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 				"text_color": "grey",
 			},
 		})
+	}
+
+	// Add metadata footer (work directory and elapsed time)
+	zh := isZhLikeProgressLang(payload.Lang)
+	if payload.WorkDir != "" || payload.StartTime > 0 {
+		if len(elements) > 0 {
+			elements = append(elements, map[string]any{"tag": "hr"})
+		}
+		if payload.WorkDir != "" {
+			workDirLabel := "Work Dir"
+			if zh {
+				workDirLabel = "工作目录"
+			}
+			elements = append(elements, map[string]any{
+				"tag": "div",
+				"text": map[string]any{
+					"tag":        "plain_text",
+					"content":    fmt.Sprintf("%s: %s", workDirLabel, payload.WorkDir),
+					"text_size":  "notation",
+					"text_color": "grey",
+				},
+			})
+		}
+		if payload.StartTime > 0 {
+			elapsed := time.Since(time.Unix(payload.StartTime, 0))
+			timeLabel := "Time"
+			if zh {
+				timeLabel = "用时"
+			}
+			elements = append(elements, map[string]any{
+				"tag": "div",
+				"text": map[string]any{
+					"tag":        "plain_text",
+					"content":    fmt.Sprintf("%s: %s", timeLabel, formatProgressDuration(elapsed)),
+					"text_size":  "notation",
+					"text_color": "grey",
+				},
+			})
+		}
+	}
+
+	// If no elements, return empty card with just title
+	if len(elements) == 0 {
+		return buildCardJSON(" ")
 	}
 
 	card := map[string]any{
