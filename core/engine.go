@@ -2515,20 +2515,57 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// Flush accumulated text segment before permission prompt
 			previewActive := sp.canPreview()
-			if len(textParts) > segmentStart {
-				if !previewActive {
-					segment := strings.Join(textParts[segmentStart:], "")
-					if segment != "" {
-						for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
-							e.send(p, replyCtx, chunk)
+			if hasRichCard {
+				// For rich card, show permission prompt in the card
+				permLimit := e.display.ToolMaxLen
+				if permLimit > 0 {
+					permLimit = permLimit * 8 / 5
+				}
+				toolInput := truncateIf(event.ToolInput, permLimit)
+				permPrompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
+				// Add permission step to tool steps
+				permSteps := append(toolSteps, ToolStep{
+					Name:    "⚠️ " + event.ToolName,
+					Summary: "等待确认: " + toolInput,
+				})
+				card := richCardSupporter.BuildRichCard(CardStatusWorking, RichCardContent{
+					Thinking:  thinkingContent,
+					Steps:     permSteps,
+					Markdown:  partialText + "\n\n---\n\n" + permPrompt,
+					Streaming: true,
+					WorkDir:   workDir,
+					StartTime: turnStart,
+				})
+				if cardMessageID == nil {
+					if starter, ok := p.(PreviewStarter); ok {
+						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
+						if err != nil {
+							slog.Debug("rich card: failed to create permission card", "platform", p.Name(), "error", err)
+						} else {
+							cardMessageID = handle
 						}
 					}
+				} else if updater, ok := p.(MessageUpdater); ok {
+					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
+						slog.Debug("rich card: failed to update permission card", "platform", p.Name(), "error", err)
+					}
 				}
-				segmentStart = len(textParts)
-			}
-			sp.freeze()
-			if previewActive {
-				sp.detachPreview() // keep frozen preview visible as permanent message
+			} else {
+				if len(textParts) > segmentStart {
+					if !previewActive {
+						segment := strings.Join(textParts[segmentStart:], "")
+						if segment != "" {
+							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+								e.send(p, replyCtx, chunk)
+							}
+						}
+					}
+					segmentStart = len(textParts)
+				}
+				sp.freeze()
+				if previewActive {
+					sp.detachPreview() // keep frozen preview visible as permanent message
+				}
 			}
 
 			slog.Info("permission request",
@@ -2536,16 +2573,19 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				"tool", event.ToolName,
 			)
 
-			if isAskQuestion {
-				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
-			} else {
-				permLimit := e.display.ToolMaxLen
-				if permLimit > 0 {
-					permLimit = permLimit * 8 / 5
+			// For non-rich-card mode, send permission prompt as separate message
+			if !hasRichCard {
+				if isAskQuestion {
+					e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				} else {
+					permLimit := e.display.ToolMaxLen
+					if permLimit > 0 {
+						permLimit = permLimit * 8 / 5
+					}
+					toolInput := truncateIf(event.ToolInput, permLimit)
+					prompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
+					e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput)
 				}
-				toolInput := truncateIf(event.ToolInput, permLimit)
-				prompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
-				e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput)
 			}
 
 			pending := &pendingPermission{
@@ -2827,6 +2867,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				firstEventLogged = false
 				waitStart = time.Now()
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx)
+				// Reset rich card state for the next turn
+				toolSteps = nil
+				cardMessageID = nil
+				partialText = ""
+				thinkingContent = ""
+				lastRichCardUpdate = time.Time{}
+				lastRichCardLen = 0
 
 				session.AddHistory("user", queued.content)
 
